@@ -179,6 +179,63 @@ class TestStreamRunMediaStripping:
         assert consumer.already_sent
 
 
+class _NoEditAdapter:
+    MAX_MESSAGE_LENGTH = 4096
+
+    def __init__(self):
+        self.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+            SimpleNamespace(success=True, message_id="msg_3"),
+        ])
+        self.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="Not supported"))
+
+    def supports_message_editing(self):
+        return False
+
+
+class TestStreamRunWithoutEditSupport:
+    @pytest.mark.asyncio
+    async def test_no_edit_adapter_sends_complete_blocks_without_cursor(self):
+        adapter = _NoEditAdapter()
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("# Title\n\nBody starts")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(" here.\n\nFinal block.")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        sent_texts = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        assert sent_texts == ["# Title", "Body starts here.", "Final block."]
+        assert all("▉" not in text for text in sent_texts)
+        adapter.edit_message.assert_not_awaited()
+        assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_no_edit_adapter_waits_for_closed_code_fence(self):
+        adapter = _NoEditAdapter()
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("```python\nprint('hi')")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        adapter.send.assert_not_awaited()
+
+        consumer.on_delta("\n```\n\nDone.")
+        await asyncio.sleep(0.08)
+        consumer.finish()
+        await task
+
+        sent_texts = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        assert sent_texts == ["```python\nprint('hi')\n```", "Done."]
+        assert all("▉" not in text for text in sent_texts)
+
+
 # ── Segment break (tool boundary) tests ──────────────────────────────────
 
 

@@ -79,7 +79,8 @@ class GatewayStreamConsumer:
         self._accumulated = ""
         self._message_id: Optional[str] = None
         self._already_sent = False
-        self._edit_supported = True  # Disabled when progressive edits are no longer usable
+        self._native_edit_supported = self._adapter_supports_message_editing()
+        self._edit_supported = self._native_edit_supported  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
         self._fallback_final_send = False
@@ -132,6 +133,88 @@ class GatewayStreamConsumer:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
 
+    def _adapter_supports_message_editing(self) -> bool:
+        checker = getattr(self.adapter, "supports_message_editing", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return True
+        return True
+
+    @staticmethod
+    def _extract_complete_markdown_blocks(text: str, final: bool = False) -> tuple[str, str]:
+        """Split text into a stable markdown prefix and an unsent remainder.
+
+        For platforms without edit support, streaming partial markdown with a
+        cursor creates artifacts and broken rendering. This helper only releases
+        complete blocks during the stream: paragraphs separated by blank lines
+        and fully closed fenced code blocks. The trailing incomplete block is
+        held until more content arrives or the stream finishes.
+        """
+        if not text:
+            return "", ""
+        if final:
+            return text.strip(), ""
+
+        lines = text.splitlines(keepends=True)
+        in_code_block = False
+        block_has_content = False
+        safe_end = 0
+        offset = 0
+
+        for raw_line in lines:
+            line = raw_line.rstrip("\r\n")
+            offset += len(raw_line)
+
+            if raw_line.endswith(("\n", "\r")):
+                has_line_break = True
+            else:
+                has_line_break = False
+
+            if re.match(r"^```([^\n`]*)\s*$", line.strip()):
+                block_has_content = True
+                in_code_block = not in_code_block
+                if not in_code_block:
+                    safe_end = offset
+                    block_has_content = False
+                continue
+
+            if in_code_block:
+                continue
+
+            if line.strip():
+                block_has_content = True
+                continue
+
+            if block_has_content and has_line_break:
+                safe_end = offset
+                block_has_content = False
+
+        if safe_end <= 0:
+            return "", text
+
+        ready = text[:safe_end].strip()
+        remainder = text[safe_end:].lstrip("\r\n")
+        return ready, remainder
+
+    async def _send_no_edit_chunk(self, text: str) -> None:
+        """Send a streaming chunk on platforms that cannot edit messages."""
+        text = self._clean_for_display(text)
+        if not text.strip():
+            return
+        try:
+            result = await self.adapter.send(
+                chat_id=self.chat_id,
+                content=text,
+                metadata=self.metadata,
+            )
+            if result.success:
+                self._already_sent = True
+                self._last_sent_text = text
+        except Exception as e:
+            logger.error("Stream send error on no-edit adapter: %s", e)
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting
@@ -173,7 +256,17 @@ class GatewayStreamConsumer:
                 )
 
                 current_update_visible = False
-                if should_edit and self._accumulated:
+                if should_edit and self._accumulated and not self._native_edit_supported:
+                    ready_text, remainder = self._extract_complete_markdown_blocks(
+                        self._accumulated,
+                        final=got_done or got_segment_break,
+                    )
+                    if ready_text:
+                        await self._send_no_edit_chunk(ready_text)
+                        self._accumulated = remainder
+                        self._last_edit_time = time.monotonic()
+
+                elif should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
@@ -237,7 +330,11 @@ class GatewayStreamConsumer:
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
                     # full response again.
-                    if self._accumulated:
+                    if not self._native_edit_supported:
+                        if self._accumulated:
+                            await self._send_no_edit_chunk(self._accumulated)
+                        self._final_response_sent = self._already_sent
+                    elif self._accumulated:
                         if self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
                         elif current_update_visible:

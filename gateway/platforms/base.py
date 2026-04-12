@@ -935,6 +935,10 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    def supports_message_editing(self) -> bool:
+        """Return True when this adapter implements in-place message edits."""
+        return type(self).edit_message is not BasePlatformAdapter.edit_message
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
