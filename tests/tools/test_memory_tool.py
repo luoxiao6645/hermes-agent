@@ -182,6 +182,13 @@ class TestMemoryStoreRemove:
         result = store.remove("memory", "  ")
         assert result["success"] is False
 
+    def test_read_returns_live_entries(self, store):
+        store.add("memory", "persistent fact")
+        result = store.read("memory")
+        assert result["success"] is True
+        assert result["entries"] == ["persistent fact"]
+        assert result["entry_count"] == 1
+
 
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
@@ -201,7 +208,7 @@ class TestMemoryStorePersistence:
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates
         mem_file = tmp_path / "MEMORY.md"
-        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry")
+        mem_file.write_text("duplicate entry\n§\nduplicate entry\n§\nunique entry", encoding="utf-8")
 
         store = MemoryStore()
         store.load_from_disk()
@@ -251,7 +258,50 @@ class TestMemoryToolDispatcher:
     def test_replace_requires_old_text(self, store):
         result = json.loads(memory_tool(action="replace", content="new", store=store))
         assert result["success"] is False
+        assert "guidance" in result
 
     def test_remove_requires_old_text(self, store):
+        store.add("memory", "delete me later")
         result = json.loads(memory_tool(action="remove", store=store))
         assert result["success"] is False
+        assert "guidance" in result
+        assert result["current_entries"] == ["delete me later"]
+
+    def test_remove_uses_content_as_fallback_identifier(self, store):
+        store.add("memory", "delete me later")
+        result = json.loads(memory_tool(action="remove", content="delete me", store=store))
+        assert result["success"] is True
+        assert result["entries"] == []
+
+    def test_read_via_tool(self, store):
+        store.add("user", "Prefers concise replies")
+        result = json.loads(memory_tool(action="read", target="user", store=store))
+        assert result["success"] is True
+        assert result["entries"] == ["Prefers concise replies"]
+
+    def test_replace_accepts_new_content_alias(self, store):
+        store.add("memory", "Python 3.11 project")
+        result = json.loads(
+            memory_tool(
+                action="replace",
+                old_text="3.11",
+                new_content="Python 3.12 project",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert result["entries"] == ["Python 3.12 project"]
+
+    def test_replace_prefers_nonempty_new_content_when_content_is_blank(self, store):
+        store.add("memory", "Python 3.11 project")
+        result = json.loads(
+            memory_tool(
+                action="replace",
+                old_text="3.11",
+                content="",
+                new_content="Python 3.12 project",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert result["entries"] == ["Python 3.12 project"]

@@ -57,6 +57,27 @@ def get_memory_dir() -> Path:
 ENTRY_DELIMITER = "\n§\n"
 
 
+def _memory_live_state(store: "MemoryStore", target: str) -> Dict[str, Any]:
+    """Return repair-friendly live state for memory tool errors."""
+    snapshot = store.read(target)
+    return {
+        "current_entries": snapshot["entries"],
+        "usage": snapshot["usage"],
+        "entry_count": snapshot["entry_count"],
+    }
+
+
+def _first_nonempty_text(*values: Optional[str]) -> Optional[str]:
+    """Return the first non-empty string after trimming, else None."""
+    for value in values:
+        if value is None:
+            continue
+        text = value.strip()
+        if text:
+            return text
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
 # in content that gets injected into the system prompt.
@@ -356,6 +377,12 @@ class MemoryStore:
 
         return self._success_response(target, "Entry removed.")
 
+    def read(self, target: str) -> Dict[str, Any]:
+        """Return the current live entries for a target."""
+        with self._file_lock(self._path_for(target)):
+            self._reload_target(target)
+            return self._success_response(target, "Current entries.")
+
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
         Return the frozen snapshot for system prompt injection.
@@ -465,6 +492,7 @@ def memory_tool(
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    new_content: str = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -478,25 +506,53 @@ def memory_tool(
     if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    action = (action or "").strip().lower()
+    replacement_content = _first_nonempty_text(content, new_content)
+    lookup_text = _first_nonempty_text(old_text)
+    if action == "remove" and not lookup_text:
+        lookup_text = _first_nonempty_text(content)
+
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
         result = store.add(target, content)
 
     elif action == "replace":
-        if not old_text:
-            return tool_error("old_text is required for 'replace' action.", success=False)
-        if not content:
+        if not lookup_text:
+            error = {
+                "success": False,
+                "error": "old_text is required for 'replace' action.",
+                "guidance": (
+                    "Call action='read' first to inspect current entries, then "
+                    "retry with old_text set to a short unique substring."
+                ),
+            }
+            error.update(_memory_live_state(store, target))
+            return json.dumps(error, ensure_ascii=False)
+        if not replacement_content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        result = store.replace(target, lookup_text, replacement_content)
 
     elif action == "remove":
-        if not old_text:
-            return tool_error("old_text is required for 'remove' action.", success=False)
-        result = store.remove(target, old_text)
+        if not lookup_text:
+            error = {
+                "success": False,
+                "error": "old_text is required for 'remove' action.",
+                "guidance": (
+                    "Call action='read' first to inspect current entries, then "
+                    "retry with old_text set to a short unique substring. "
+                    "For remove, content is also accepted as a fallback identifier."
+                ),
+            }
+            error.update(_memory_live_state(store, target))
+            return json.dumps(error, ensure_ascii=False)
+        result = store.remove(target, lookup_text)
+
+    elif action == "read":
+        result = store.read(target)
 
     else:
-        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+        return tool_error(f"Unknown action '{action}'. Use: add, replace, remove, read", success=False)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -532,7 +588,8 @@ MEMORY_SCHEMA = {
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
-        "remove (delete -- old_text identifies it).\n\n"
+        "remove (delete -- old_text identifies it, with content accepted as a fallback "
+        "identifier), read (inspect current live entries).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
     ),
     "parameters": {
@@ -540,7 +597,7 @@ MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove"],
+                "enum": ["add", "replace", "remove", "read"],
                 "description": "The action to perform."
             },
             "target": {
@@ -550,11 +607,15 @@ MEMORY_SCHEMA = {
             },
             "content": {
                 "type": "string",
-                "description": "The entry content. Required for 'add' and 'replace'."
+                "description": "Entry content. Required for 'add'; replacement content for 'replace'; optional fallback identifier for 'remove'."
             },
             "old_text": {
                 "type": "string",
-                "description": "Short unique substring identifying the entry to replace or remove."
+                "description": "Short unique substring identifying the entry to replace or remove. Preferred for both actions."
+            },
+            "new_content": {
+                "type": "string",
+                "description": "Optional alias for replacement content when action='replace'."
             },
         },
         "required": ["action", "target"],
@@ -574,6 +635,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        new_content=args.get("new_content"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

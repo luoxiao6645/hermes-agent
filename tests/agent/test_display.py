@@ -8,6 +8,7 @@ from agent.display import (
     build_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
+    get_cute_tool_message,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
     render_edit_diff_with_delta,
@@ -83,6 +84,18 @@ class TestBuildToolPreview:
         assert result is not None
         assert "user" in result
 
+    def test_memory_tool_remove_uses_content_fallback_preview(self):
+        result = build_tool_preview("memory", {"action": "remove", "target": "memory", "content": "stale note"})
+        assert result == '-memory: "stale note"'
+
+    def test_memory_tool_replace_marks_missing_old_text(self):
+        result = build_tool_preview("memory", {"action": "replace", "target": "memory", "content": "new note"})
+        assert result == '~memory: "<missing old_text>"'
+
+    def test_memory_tool_null_old_text_marks_missing(self):
+        result = build_tool_preview("memory", {"action": "remove", "target": "memory", "old_text": None})
+        assert result == '-memory: "<missing old_text>"'
+
     def test_session_search_preview(self):
         result = build_tool_preview("session_search", {"query": "find something"})
         assert result is not None
@@ -93,6 +106,18 @@ class TestBuildToolPreview:
         assert build_tool_preview("terminal", 0) is None
         assert build_tool_preview("terminal", "") is None
         assert build_tool_preview("terminal", []) is None
+
+    def test_cute_memory_remove_uses_content_fallback_preview(self):
+        result = get_cute_tool_message("memory", {"action": "remove", "target": "memory", "content": "stale note"}, 0.0)
+        assert '-memory: "stale note"' in result
+
+    def test_cute_memory_replace_marks_missing_old_text(self):
+        result = get_cute_tool_message("memory", {"action": "replace", "target": "memory", "content": "new note"}, 0.0)
+        assert '~memory: "<missing old_text>"' in result
+
+    def test_cute_memory_null_old_text_marks_missing(self):
+        result = get_cute_tool_message("memory", {"action": "remove", "target": "memory", "old_text": None}, 0.0)
+        assert '-memory: "<missing old_text>"' in result
 
 
 class TestEditDiffPreview:

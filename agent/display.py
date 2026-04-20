@@ -167,6 +167,20 @@ def _oneline(text: str) -> str:
     return " ".join(text.split())
 
 
+def _memory_lookup_preview(args: dict) -> str:
+    """Return the best available identifier preview for memory replace/remove."""
+    raw_old_text = args.get("old_text")
+    old_text = _oneline("" if raw_old_text is None else str(raw_old_text))
+    if old_text:
+        return old_text
+    if args.get("action") == "remove":
+        raw_content = args.get("content")
+        content = _oneline("" if raw_content is None else str(raw_content))
+        if content:
+            return content
+    return "<missing old_text>"
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -225,9 +239,11 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             content = _oneline(args.get("content", ""))
             return f"+{target}: \"{content[:25]}{'...' if len(content) > 25 else ''}\""
         elif action == "replace":
-            return f"~{target}: \"{_oneline(args.get('old_text', '')[:20])}\""
+            preview = _memory_lookup_preview(args)
+            return f"~{target}: \"{preview[:20]}{'...' if len(preview) > 20 else ''}\""
         elif action == "remove":
-            return f"-{target}: \"{_oneline(args.get('old_text', '')[:20])}\""
+            preview = _memory_lookup_preview(args)
+            return f"-{target}: \"{preview[:20]}{'...' if len(preview) > 20 else ''}\""
         return action
 
     if tool_name == "send_message":
@@ -939,9 +955,9 @@ def get_cute_tool_message(
         if action == "add":
             return _wrap(f"┊ 🧠 memory    +{target}: \"{_trunc(args.get('content', ''), 30)}\"  {dur}")
         elif action == "replace":
-            return _wrap(f"┊ 🧠 memory    ~{target}: \"{_trunc(args.get('old_text', ''), 20)}\"  {dur}")
+            return _wrap(f"┊ 🧠 memory    ~{target}: \"{_trunc(_memory_lookup_preview(args), 20)}\"  {dur}")
         elif action == "remove":
-            return _wrap(f"┊ 🧠 memory    -{target}: \"{_trunc(args.get('old_text', ''), 20)}\"  {dur}")
+            return _wrap(f"┊ 🧠 memory    -{target}: \"{_trunc(_memory_lookup_preview(args), 20)}\"  {dur}")
         return _wrap(f"┊ 🧠 memory    {action}  {dur}")
     if tool_name == "skills_list":
         return _wrap(f"┊ 📚 skills    list {args.get('category', 'all')}  {dur}")
