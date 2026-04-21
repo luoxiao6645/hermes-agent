@@ -136,6 +136,9 @@ def _make_fake_mautrix():
         async def get_members(self, room_id):
             return []
 
+        async def has_full_member_list(self, room_id):
+            return False
+
         async def get_member_profiles(self, room_id):
             return {}
 
@@ -448,7 +451,7 @@ class TestMatrixDmDetection:
 
     @pytest.mark.asyncio
     async def test_refresh_dm_cache_with_m_direct(self):
-        """_refresh_dm_cache should only positively mark rooms in m.direct."""
+        """_refresh_dm_cache should add positive DM cache entries only."""
         self.adapter._joined_rooms = {"!room_a:ex.org", "!room_b:ex.org", "!room_c:ex.org"}
 
         mock_client = MagicMock()
@@ -467,62 +470,41 @@ class TestMatrixDmDetection:
         assert "!room_c:ex.org" not in self.adapter._dm_rooms
 
     @pytest.mark.asyncio
-    async def test_is_dm_room_falls_back_to_joined_members(self):
-        """Fresh rooms not in m.direct should still be recognized as DMs."""
-        mock_state_store = MagicMock()
-        mock_state_store.has_full_member_list = AsyncMock(return_value=False)
-        mock_state_store.get_members = AsyncMock(return_value=[])
+    async def test_is_dm_room_uses_full_member_list_when_authoritative(self):
+        """Authoritative state-store membership should be trusted."""
+        state_store = MagicMock()
+        state_store.has_full_member_list = AsyncMock(return_value=True)
+        state_store.get_members = AsyncMock(return_value=["@alice:ex.org", "@bot:ex.org"])
 
         mock_client = MagicMock()
-        mock_client.state_store = mock_state_store
-        mock_client.get_joined_members = AsyncMock(
-            return_value={
-                "@bot:ex.org": MagicMock(),
-                "@alice:ex.org": MagicMock(),
-            }
-        )
-        self.adapter._client = mock_client
-
-        assert await self.adapter._is_dm_room("!fresh_dm:ex.org") is True
-        assert self.adapter._dm_rooms["!fresh_dm:ex.org"] is True
-
-    @pytest.mark.asyncio
-    async def test_is_dm_room_ignores_partial_state_store_and_falls_back(self):
-        """An incomplete state store must not negative-cache a fresh DM."""
-        mock_state_store = MagicMock()
-        mock_state_store.has_full_member_list = AsyncMock(return_value=False)
-        mock_state_store.get_members = AsyncMock(return_value=["@bot:ex.org"])
-
-        mock_client = MagicMock()
-        mock_client.state_store = mock_state_store
-        mock_client.get_joined_members = AsyncMock(
-            return_value={
-                "@bot:ex.org": MagicMock(),
-                "@alice:ex.org": MagicMock(),
-            }
-        )
-        self.adapter._client = mock_client
-
-        assert await self.adapter._is_dm_room("!partial_dm:ex.org") is True
-        assert self.adapter._dm_rooms["!partial_dm:ex.org"] is True
-
-    @pytest.mark.asyncio
-    async def test_is_dm_room_full_member_list_can_cache_group_false(self):
-        """A complete state-store member list may authoritatively cache group rooms."""
-        mock_state_store = MagicMock()
-        mock_state_store.has_full_member_list = AsyncMock(return_value=True)
-        mock_state_store.get_members = AsyncMock(
-            return_value=["@bot:ex.org", "@alice:ex.org", "@bob:ex.org"]
-        )
-
-        mock_client = MagicMock()
-        mock_client.state_store = mock_state_store
+        mock_client.state_store = state_store
         mock_client.get_joined_members = AsyncMock()
         self.adapter._client = mock_client
 
-        assert await self.adapter._is_dm_room("!group:ex.org") is False
-        assert self.adapter._dm_rooms["!group:ex.org"] is False
+        assert await self.adapter._is_dm_room("!room_a:ex.org") is True
         mock_client.get_joined_members.assert_not_awaited()
+        assert self.adapter._dm_rooms["!room_a:ex.org"] is True
+
+    @pytest.mark.asyncio
+    async def test_is_dm_room_falls_back_to_joined_members_for_fresh_rooms(self):
+        """Fresh rooms should use joined_members when local state is incomplete."""
+        state_store = MagicMock()
+        state_store.has_full_member_list = AsyncMock(return_value=False)
+        state_store.get_members = AsyncMock(return_value=["@bot:ex.org"])
+
+        mock_client = MagicMock()
+        mock_client.state_store = state_store
+        mock_client.get_joined_members = AsyncMock(
+            return_value={
+                "@alice:ex.org": MagicMock(),
+                "@bot:ex.org": MagicMock(),
+            }
+        )
+        self.adapter._client = mock_client
+
+        assert await self.adapter._is_dm_room("!fresh:ex.org") is True
+        mock_client.get_joined_members.assert_awaited_once()
+        assert self.adapter._dm_rooms["!fresh:ex.org"] is True
 
 
 # ---------------------------------------------------------------------------

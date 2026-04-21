@@ -231,7 +231,9 @@ class MatrixAdapter(BasePlatformAdapter):
         self._closing = False
         self._startup_ts: float = 0.0
 
-        # Cache: room_id → bool (is DM)
+        # Positive DM cache: room_id -> True once we have authoritative
+        # evidence the room is a DM. We avoid negative caching because fresh
+        # Matrix rooms can have incomplete local membership state.
         self._dm_rooms: Dict[str, bool] = {}
         # Set of room IDs we've joined
         self._joined_rooms: Set[str] = set()
@@ -247,22 +249,27 @@ class MatrixAdapter(BasePlatformAdapter):
         # Thread participation tracking (for require_mention bypass)
         self._threads = ThreadParticipationTracker("matrix")
 
-        # Mention/thread gating — parsed once from env vars.
-        self._require_mention: bool = os.getenv(
-            "MATRIX_REQUIRE_MENTION", "true"
-        ).lower() not in ("false", "0", "no")
-        free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
-        self._free_rooms: Set[str] = {
-            r.strip() for r in free_rooms_raw.split(",") if r.strip()
-        }
-        self._auto_thread: bool = os.getenv("MATRIX_AUTO_THREAD", "true").lower() in (
-            "true",
-            "1",
-            "yes",
+        # Mention/thread gating. Match the other adapters by honoring
+        # config.extra first, then env vars.
+        self._require_mention: bool = self._config_bool(
+            "require_mention",
+            env_var="MATRIX_REQUIRE_MENTION",
+            default=True,
         )
-        self._dm_mention_threads: bool = os.getenv(
-            "MATRIX_DM_MENTION_THREADS", "false"
-        ).lower() in ("true", "1", "yes")
+        free_rooms_raw = config.extra.get("free_response_rooms")
+        if free_rooms_raw is None:
+            free_rooms_raw = os.getenv("MATRIX_FREE_RESPONSE_ROOMS", "")
+        self._free_rooms: Set[str] = self._string_set(free_rooms_raw)
+        self._auto_thread: bool = self._config_bool(
+            "auto_thread",
+            env_var="MATRIX_AUTO_THREAD",
+            default=True,
+        )
+        self._dm_mention_threads: bool = self._config_bool(
+            "dm_mention_threads",
+            env_var="MATRIX_DM_MENTION_THREADS",
+            default=False,
+        )
 
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
         self._reactions_enabled: bool = os.getenv(
@@ -293,6 +300,33 @@ class MatrixAdapter(BasePlatformAdapter):
         self._processed_events.append(event_id)
         self._processed_events_set.add(event_id)
         return False
+
+    def _config_bool(self, key: str, *, env_var: str, default: bool) -> bool:
+        """Read a boolean from config.extra first, then the environment."""
+        raw = self.config.extra.get(key)
+        if raw is None:
+            raw = os.getenv(env_var)
+        if raw is None:
+            return default
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            value = raw.strip().lower()
+            if value in ("true", "1", "yes", "on"):
+                return True
+            if value in ("false", "0", "no", "off"):
+                return False
+            return default if value == "" else bool(raw)
+        return bool(raw)
+
+    @staticmethod
+    def _string_set(raw: Any) -> Set[str]:
+        """Normalize a comma-separated string or list-like value to a set."""
+        if raw is None:
+            return set()
+        if isinstance(raw, (list, tuple, set)):
+            return {str(item).strip() for item in raw if str(item).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -1111,7 +1145,14 @@ class MatrixAdapter(BasePlatformAdapter):
                 _sync_msg = getattr(sync_data, "message", None)
                 if _sync_msg and isinstance(_sync_msg, str):
                     _lower = _sync_msg.lower()
-                    if "m_unknown_token" in _lower or "unknown_token" in _lower:
+                    if (
+                        "m_unknown_token" in _lower
+                        or "unknown_token" in _lower
+                        or "token is not active" in _lower
+                        or "invalid access token" in _lower
+                        or "access token has expired" in _lower
+                        or "soft logout" in _lower
+                    ):
                         logger.error(
                             "Matrix: permanent auth error from sync: %s — stopping",
                             _sync_msg,
@@ -1124,6 +1165,35 @@ class MatrixAdapter(BasePlatformAdapter):
                     if rooms_join:
                         self._joined_rooms.update(rooms_join.keys())
 
+                    timeline_events = 0
+                    encrypted_events = 0
+                    message_events = 0
+                    for room_data in rooms_join.values():
+                        events = (
+                            room_data.get("timeline", {}).get("events", [])
+                            if isinstance(room_data, dict)
+                            else []
+                        )
+                        timeline_events += len(events)
+                        for evt in events:
+                            if not isinstance(evt, dict):
+                                continue
+                            evt_type = evt.get("type")
+                            if evt_type == "m.room.encrypted":
+                                encrypted_events += 1
+                            elif evt_type == "m.room.message":
+                                message_events += 1
+
+                    logger.debug(
+                        "Matrix: sync received joined_rooms=%d timeline_events=%d "
+                        "message_events=%d encrypted_events=%d since=%s",
+                        len(rooms_join),
+                        timeline_events,
+                        message_events,
+                        encrypted_events,
+                        "set" if next_batch else "none",
+                    )
+
                     # Advance the sync token so the next request is
                     # incremental instead of a full initial sync.
                     nb = sync_data.get("next_batch")
@@ -1135,10 +1205,19 @@ class MatrixAdapter(BasePlatformAdapter):
                     # _on_room_message / _on_reaction / _on_invite fire.
                     try:
                         tasks = client.handle_sync(sync_data)
+                        logger.debug(
+                            "Matrix: handle_sync queued %d task(s)",
+                            len(tasks) if tasks else 0,
+                        )
                         if tasks:
                             await asyncio.gather(*tasks)
                     except Exception as exc:
                         logger.warning("Matrix: sync event dispatch error: %s", exc)
+                else:
+                    logger.debug(
+                        "Matrix: sync returned non-dict payload of type %s",
+                        type(sync_data).__name__,
+                    )
 
             except asyncio.CancelledError:
                 return
@@ -1152,6 +1231,12 @@ class MatrixAdapter(BasePlatformAdapter):
                     or "403" in err_str
                     or "unauthorized" in err_str
                     or "forbidden" in err_str
+                    or "m_unknown_token" in err_str
+                    or "unknown_token" in err_str
+                    or "token is not active" in err_str
+                    or "invalid access token" in err_str
+                    or "access token has expired" in err_str
+                    or "soft logout" in err_str
                 ):
                     logger.error(
                         "Matrix: permanent auth error: %s — stopping sync", exc
@@ -1207,6 +1292,14 @@ class MatrixAdapter(BasePlatformAdapter):
             msgtype = content.get("msgtype", "")
         else:
             msgtype = ""
+
+        logger.debug(
+            "Matrix: received event %s in %s from %s (msgtype=%s)",
+            event_id or "?",
+            room_id or "?",
+            sender or "?",
+            msgtype or "?",
+        )
 
         # Determine source content dict for relation/thread extraction.
         if isinstance(content, dict):
@@ -1274,10 +1367,11 @@ class MatrixAdapter(BasePlatformAdapter):
             if self._require_mention and not is_free_room and not in_bot_thread:
                 if not is_mentioned:
                     logger.debug(
-                        "Matrix: ignoring unmentioned event %s in %s "
-                        "(require_mention=true, free_room=%s, bot_thread=%s)",
+                        "Matrix: dropped event %s in %s due to require_mention "
+                        "(is_dm=%s, free_room=%s, in_bot_thread=%s)",
                         event_id or "(unknown)",
-                        room_id or "(unknown)",
+                        room_id,
+                        is_dm,
                         is_free_room,
                         in_bot_thread,
                     )
@@ -1932,56 +2026,59 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _is_dm_room(self, room_id: str) -> bool:
         """Check if a room is a DM."""
-        cached = self._dm_rooms.get(room_id)
-        if cached is not None:
-            return cached
-        # Only trust the state store when it confirms the member list is
-        # complete. Freshly joined rooms may have partial membership there.
-        state_store = (
-            getattr(self._client, "state_store", None) if self._client else None
-        )
-        if state_store:
-            try:
-                has_full_member_list = getattr(state_store, "has_full_member_list", None)
-                state_store_complete = False
-                if has_full_member_list:
-                    state_store_complete = bool(await has_full_member_list(room_id))
+        if self._dm_rooms.get(room_id, False):
+            logger.debug("Matrix: DM detection for %s via cache: True", room_id)
+            return True
 
-                if state_store_complete:
+        # Prefer authoritative local membership state when available.
+        state_store = getattr(self._client, "state_store", None) if self._client else None
+        if state_store and hasattr(state_store, "get_members"):
+            try:
+                has_full_member_list = True
+                source = "state_store_legacy"
+                if hasattr(state_store, "has_full_member_list"):
+                    has_full_member_list = await state_store.has_full_member_list(room_id)
+                    source = "state_store_full"
+                if has_full_member_list:
                     members = await state_store.get_members(room_id)
-                    is_dm = len(members) == 2
-                    self._dm_rooms[room_id] = is_dm
+                    member_count = len(members or [])
+                    is_dm = member_count == 2
                     logger.debug(
-                        "Matrix: DM detection for %s resolved via state_store_full -> %s",
+                        "Matrix: DM detection for %s via %s (members=%d): %s",
                         room_id,
-                        "dm" if is_dm else "group",
+                        source,
+                        member_count,
+                        is_dm,
                     )
+                    if is_dm:
+                        self._dm_rooms[room_id] = True
                     return is_dm
             except Exception as exc:
                 logger.debug(
-                    "Matrix: state_store DM detection failed for %s: %s",
+                    "Matrix: DM detection via state_store failed for %s: %s",
                     room_id,
                     exc,
                 )
 
-        # Freshly joined 1:1 rooms are often missing from m.direct on the bot
-        # account. Fall back to the joined-members API so a new DM isn't
-        # misclassified as a group room that requires an explicit mention.
+        # Fresh rooms can have incomplete local membership data right after
+        # join; ask the server directly before deciding the room is not a DM.
         if self._client and hasattr(self._client, "get_joined_members"):
             try:
-                joined_members = await self._client.get_joined_members(RoomID(room_id))
-                if joined_members:
-                    is_dm = len(joined_members) == 2
-                    self._dm_rooms[room_id] = is_dm
-                    logger.debug(
-                        "Matrix: DM detection for %s resolved via joined_members -> %s",
-                        room_id,
-                        "dm" if is_dm else "group",
-                    )
-                    return is_dm
+                members = await self._client.get_joined_members(RoomID(room_id))
+                member_count = len(members or {})
+                is_dm = member_count == 2
+                logger.debug(
+                    "Matrix: DM detection for %s via joined_members (members=%d): %s",
+                    room_id,
+                    member_count,
+                    is_dm,
+                )
+                if is_dm:
+                    self._dm_rooms[room_id] = True
+                return is_dm
             except Exception as exc:
                 logger.debug(
-                    "Matrix: get_joined_members(%s) failed during DM detection: %s",
+                    "Matrix: DM detection via joined_members failed for %s: %s",
                     room_id,
                     exc,
                 )
@@ -2011,12 +2108,8 @@ class MatrixAdapter(BasePlatformAdapter):
             if isinstance(rooms, list):
                 dm_room_ids.update(str(r) for r in rooms)
 
-        # m.direct is reliable as a positive DM signal, but not as a negative
-        # one: fresh 1:1 rooms often appear here late or never. Only cache
-        # rooms that are explicitly marked as DMs.
-        for rid in self._joined_rooms:
-            if rid in dm_room_ids:
-                self._dm_rooms[rid] = True
+        for room_id in dm_room_ids:
+            self._dm_rooms[room_id] = True
 
     # ------------------------------------------------------------------
     # Mention detection helpers

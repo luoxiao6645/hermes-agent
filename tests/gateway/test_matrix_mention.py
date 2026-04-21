@@ -16,17 +16,21 @@ from gateway.config import PlatformConfig
 # needing real mautrix APIs mock them individually.
 
 
-def _make_adapter(tmp_path=None):
+def _make_adapter(tmp_path=None, extra=None):
     """Create a MatrixAdapter with mocked config."""
     from gateway.platforms.matrix import MatrixAdapter
+
+    merged_extra = {
+        "homeserver": "https://matrix.example.org",
+        "user_id": "@hermes:example.org",
+    }
+    if extra:
+        merged_extra.update(extra)
 
     config = PlatformConfig(
         enabled=True,
         token="syt_test_token",
-        extra={
-            "homeserver": "https://matrix.example.org",
-            "user_id": "@hermes:example.org",
-        },
+        extra=merged_extra,
     )
     adapter = MatrixAdapter(config)
     adapter._text_batch_delay_seconds = 0  # disable batching for tests
@@ -444,6 +448,20 @@ async def test_require_mention_disabled_skips_stripping(monkeypatch):
     adapter.handle_message.assert_awaited_once()
     msg = adapter.handle_message.await_args.args[0]
     assert msg.text == "@hermes:example.org help me"
+
+
+@pytest.mark.asyncio
+async def test_require_mention_disabled_via_config_extra(monkeypatch):
+    """config.extra should disable mention gating even without env vars."""
+    monkeypatch.delenv("MATRIX_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("MATRIX_FREE_RESPONSE_ROOMS", raising=False)
+    monkeypatch.setenv("MATRIX_AUTO_THREAD", "false")
+
+    adapter = _make_adapter(extra={"require_mention": False})
+    event = _make_event("hello without mention")
+
+    await adapter._on_room_message(event)
+    adapter.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
