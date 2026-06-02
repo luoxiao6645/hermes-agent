@@ -626,7 +626,7 @@ def _has_any_provider_configured() -> bool:
         if isinstance(entries, (list, tuple)):
             for entry in entries:
                 if isinstance(entry, dict):
-                    key_env = str(entry.get("key_env") or "").strip()
+                    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
                     if key_env:
                         provider_env_vars.add(key_env)
 
